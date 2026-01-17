@@ -21,13 +21,13 @@ proc getConfig*(path: string): (Config, parseCfg.Config) =
     httpMaxConns: cfg.get("Server", "httpMaxConnections", 100),
     staticDir: cfg.get("Server", "staticDir", "./public"),
     title: cfg.get("Server", "title", "Nitter"),
-    hostname: cfg.get("Server", "hostname", "nitter.net"),
+    hostname: cfg.get("Server", "hostname", "nitter-kurrna.net"),
 
     # Cache
     listCacheTime: cfg.get("Cache", "listMinutes", 120),
     rssCacheTime: cfg.get("Cache", "rssMinutes", 10),
 
-    redisHost: cfg.get("Cache", "redisHost", "localhost"),
+    redisHost: cfg.get("Cache", "redisHost", "nitter-redis"),
     redisPort: cfg.get("Cache", "redisPort", 6379),
     redisConns: cfg.get("Cache", "redisConnections", 20),
     redisMaxConns: cfg.get("Cache", "redisMaxConnections", 30),
