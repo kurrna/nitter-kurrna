@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-import asyncdispatch, times, strformat, strutils, tables, hashes
-import redis, redpool, flatty, supersnappy
+import asyncdispatch, times, strformat, strutils, tables, hashes, os
+import httpclient, json
+import flatty, supersnappy
 
 import types, api
 
@@ -9,12 +10,71 @@ const
   baseCacheTime = 60 * 60
 
 var
-  pool: RedisPool
+  upstashUrl: string
+  upstashToken: string
   rssCacheTime: int
   listCacheTime*: int
 
-template dawait(future) =
-  discard await future
+# Upstash REST API client
+proc redisCmd(args: seq[string]): Future[JsonNode] {.async.} =
+  let client = newAsyncHttpClient()
+  defer: client.close()
+  
+  client.headers = newHttpHeaders({
+    "Authorization": "Bearer " & upstashToken,
+    "Content-Type": "application/json"
+  })
+  
+  var cmdArray = newJArray()
+  for arg in args:
+    cmdArray.add(%arg)
+  
+  try:
+    let resp = await client.post(upstashUrl, body = $cmdArray)
+    let body = await resp.body
+    result = parseJson(body)
+  except:
+    result = newJNull()
+
+proc redisGet(key: string): Future[string] {.async.} =
+  let resp = await redisCmd(@["GET", key])
+  if resp.kind == JObject and resp.hasKey("result"):
+    if resp["result"].kind == JString:
+      result = resp["result"].getStr()
+    elif resp["result"].kind == JNull:
+      result = redisNil
+    else:
+      result = redisNil
+  else:
+    result = redisNil
+
+proc redisSetEx(key: string; time: int; data: string) {.async.} =
+  discard await redisCmd(@["SETEX", key, $time, data])
+
+proc redisHSet(key, field, value: string) {.async.} =
+  discard await redisCmd(@["HSET", key, field, value])
+
+proc redisHGet(key, field: string): Future[string] {.async.} =
+  let resp = await redisCmd(@["HGET", key, field])
+  if resp.kind == JObject and resp.hasKey("result"):
+    if resp["result"].kind == JString:
+      result = resp["result"].getStr()
+    elif resp["result"].kind == JNull:
+      result = redisNil
+    else:
+      result = redisNil
+  else:
+    result = redisNil
+
+proc redisExpire(key: string; seconds: int) {.async.} =
+  discard await redisCmd(@["EXPIRE", key, $seconds])
+
+proc redisPing(): Future[bool] {.async.} =
+  let resp = await redisCmd(@["PING"])
+  if resp.kind == JObject and resp.hasKey("result"):
+    result = resp["result"].getStr() == "PONG"
+  else:
+    result = false
 
 # flatty can't serialize DateTime, so we need to define this
 proc toFlatty*(s: var string, x: DateTime) =
@@ -29,37 +89,25 @@ proc setCacheTimes*(cfg: Config) =
   rssCacheTime = cfg.rssCacheTime * 60
   listCacheTime = cfg.listCacheTime * 60
 
-proc migrate*(key, match: string) {.async.} =
-  pool.withAcquire(r):
-    let hasKey = await r.get(key)
-    if hasKey == redisNil:
-      let list = await r.scan(newCursor(0), match, 100000)
-      r.startPipelining()
-      for item in list:
-        dawait r.del(item)
-      await r.setk(key, "true")
-      dawait r.flushPipeline()
-
 proc initRedisPool*(cfg: Config) {.async.} =
+  # Get Upstash REST API credentials from environment
+  upstashUrl = getEnv("UPSTASH_REDIS_REST_URL", "")
+  upstashToken = getEnv("UPSTASH_REDIS_REST_TOKEN", "")
+  
+  if upstashUrl.len == 0 or upstashToken.len == 0:
+    stdout.write "ERROR: UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN environment variables are required.\n"
+    stdout.write "Get these values from your Upstash Redis dashboard.\n"
+    stdout.flushFile
+    quit(1)
+  
+  # Test connection with PING
   try:
-    pool = await newRedisPool(cfg.redisConns, cfg.redisMaxConns,
-                              host=cfg.redisHost, port=cfg.redisPort,
-                              password=cfg.redisPassword)
-
-    await migrate("flatty", "*:*")
-    await migrate("snappyRss", "rss:*")
-    await migrate("userBuckets", "p:*")
-    await migrate("profileDates", "p:*")
-    await migrate("profileStats", "p:*")
-    await migrate("userType", "p:*")
-    await migrate("verifiedType", "p:*")
-
-    pool.withAcquire(r):
-      # optimize memory usage for user ID buckets
-      await r.configSet("hash-max-ziplist-entries", "1000")
-
-  except OSError:
-    stdout.write "Failed to connect to Redis.\n"
+    let ok = await redisPing()
+    if not ok:
+      raise newException(IOError, "Redis PING failed")
+  except:
+    stdout.write "Failed to connect to Upstash Redis.\nURL: " & upstashUrl & "\n"
+    stdout.write "Error: " & getCurrentExceptionMsg() & "\n"
     stdout.flushFile
     quit(1)
 
@@ -69,18 +117,15 @@ template listKey(l: List): string = "l:" & l.id
 template tweetKey(id: int64): string = "t:" & $id
 
 proc get(query: string): Future[string] {.async.} =
-  pool.withAcquire(r):
-    result = await r.get(query)
+  result = await redisGet(query)
 
 proc setEx(key: string; time: int; data: string) {.async.} =
-  pool.withAcquire(r):
-    dawait r.setEx(key, time, data)
+  await redisSetEx(key, time, data)
 
 proc cacheUserId(username, id: string) {.async.} =
   if username.len == 0 or id.len == 0: return
   let name = toLower(username)
-  pool.withAcquire(r):
-    dawait r.hSet(name.uidKey, name, id)
+  await redisHSet(name.uidKey, name, id)
 
 proc cache*(data: List) {.async.} =
   await setEx(data.listKey, listCacheTime, compress(toFlatty(data)))
@@ -92,21 +137,18 @@ proc cache*(data: User) {.async.} =
   if data.username.len == 0: return
   let name = toLower(data.username)
   await cacheUserId(name, data.id)
-  pool.withAcquire(r):
-    dawait r.setEx(name.userKey, baseCacheTime, compress(toFlatty(data)))
+  await redisSetEx(name.userKey, baseCacheTime, compress(toFlatty(data)))
 
 proc cache*(data: Tweet) {.async.} =
   if data.isNil or data.id == 0: return
-  pool.withAcquire(r):
-    dawait r.setEx(data.id.tweetKey, baseCacheTime, compress(toFlatty(data)))
+  await redisSetEx(data.id.tweetKey, baseCacheTime, compress(toFlatty(data)))
 
 proc cacheRss*(query: string; rss: Rss) {.async.} =
   let key = "rss:" & query
-  pool.withAcquire(r):
-    dawait r.hSet(key, "min", rss.cursor)
-    if rss.cursor != "suspended":
-      dawait r.hSet(key, "rss", compress(rss.feed))
-    dawait r.expire(key, rssCacheTime)
+  await redisHSet(key, "min", rss.cursor)
+  if rss.cursor != "suspended":
+    await redisHSet(key, "rss", compress(rss.feed))
+  await redisExpire(key, rssCacheTime)
 
 template deserialize(data, T) =
   try:
@@ -116,15 +158,14 @@ template deserialize(data, T) =
 
 proc getUserId*(username: string): Future[string] {.async.} =
   let name = toLower(username)
-  pool.withAcquire(r):
-    result = await r.hGet(name.uidKey, name)
-    if result == redisNil:
-      let user = await getGraphUser(username)
-      if user.suspended:
-        return "suspended"
-      else:
-        await all(cacheUserId(name, user.id), cache(user))
-        return user.id
+  result = await redisHGet(name.uidKey, name)
+  if result == redisNil:
+    let user = await getGraphUser(username)
+    if user.suspended:
+      return "suspended"
+    else:
+      await all(cacheUserId(name, user.id), cache(user))
+      return user.id
 
 proc getCachedUser*(username: string; fetch=true): Future[User] {.async.} =
   let prof = await get("p:" & toLower(username))
@@ -182,13 +223,12 @@ proc getCachedList*(username=""; slug=""; id=""): Future[List] {.async.} =
 
 proc getCachedRss*(key: string): Future[Rss] {.async.} =
   let k = "rss:" & key
-  pool.withAcquire(r):
-    result.cursor = await r.hGet(k, "min")
-    if result.cursor.len > 2:
-      if result.cursor != "suspended":
-        let feed = await r.hGet(k, "rss")
-        if feed.len > 0 and feed != redisNil:
-          try: result.feed = uncompress feed
-          except: echo "Decompressing RSS failed: ", feed
-    else:
-      result.cursor.setLen 0
+  result.cursor = await redisHGet(k, "min")
+  if result.cursor.len > 2:
+    if result.cursor != "suspended":
+      let feed = await redisHGet(k, "rss")
+      if feed.len > 0 and feed != redisNil:
+        try: result.feed = uncompress feed
+        except: echo "Decompressing RSS failed: ", feed
+  else:
+    result.cursor.setLen 0
