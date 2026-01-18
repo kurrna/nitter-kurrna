@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import asyncdispatch, times, strformat, strutils, tables, hashes, os
-import httpclient, json, base64
-import flatty, supersnappy
+import httpclient, json
+import jsony
 
 import types, api
 
@@ -15,15 +15,14 @@ var
   rssCacheTime: int
   listCacheTime*: int
 
-# Base64 encode/decode for binary data over REST API
-proc encodeForRedis(data: string): string =
-  encode(data)
+# Custom jsony hooks for DateTime (convert to/from Unix timestamp)
+proc dumpHook*(s: var string; v: DateTime) =
+  s.add $v.toTime().toUnix()
 
-proc decodeFromRedis(data: string): string =
-  try:
-    decode(data)
-  except:
-    data  # Return original if not base64
+proc parseHook*(s: string; i: var int; v: var DateTime) =
+  var unix: int64
+  parseHook(s, i, unix)
+  v = fromUnix(unix).utc()
 
 # Upstash REST API client
 proc redisCmd(args: seq[string]): Future[JsonNode] {.async.} =
@@ -61,6 +60,9 @@ proc redisGet(key: string): Future[string] {.async.} =
 proc redisSetEx(key: string; time: int; data: string) {.async.} =
   discard await redisCmd(@["SETEX", key, $time, data])
 
+proc redisDel(key: string) {.async.} =
+  discard await redisCmd(@["DEL", key])
+
 proc redisHSet(key, field, value: string) {.async.} =
   discard await redisCmd(@["HSET", key, field, value])
 
@@ -85,15 +87,6 @@ proc redisPing(): Future[bool] {.async.} =
     result = resp["result"].getStr() == "PONG"
   else:
     result = false
-
-# flatty can't serialize DateTime, so we need to define this
-proc toFlatty*(s: var string, x: DateTime) =
-  s.toFlatty(x.toTime().toUnix())
-
-proc fromFlatty*(s: string, i: var int, x: var DateTime) =
-  var unix: int64
-  s.fromFlatty(i, unix)
-  x = fromUnix(unix).utc()
 
 proc setCacheTimes*(cfg: Config) =
   rssCacheTime = cfg.rssCacheTime * 60
@@ -138,33 +131,27 @@ proc cacheUserId(username, id: string) {.async.} =
   await redisHSet(name.uidKey, name, id)
 
 proc cache*(data: List) {.async.} =
-  await setEx(data.listKey, listCacheTime, encodeForRedis(compress(toFlatty(data))))
+  await setEx(data.listKey, listCacheTime, data.toJson())
 
 proc cache*(data: PhotoRail; name: string) {.async.} =
-  await setEx("pr2:" & toLower(name), baseCacheTime * 2, encodeForRedis(compress(toFlatty(data))))
+  await setEx("pr2:" & toLower(name), baseCacheTime * 2, data.toJson())
 
 proc cache*(data: User) {.async.} =
   if data.username.len == 0: return
   let name = toLower(data.username)
   await cacheUserId(name, data.id)
-  await redisSetEx(name.userKey, baseCacheTime, encodeForRedis(compress(toFlatty(data))))
+  await redisSetEx(name.userKey, baseCacheTime, data.toJson())
 
 proc cache*(data: Tweet) {.async.} =
   if data.isNil or data.id == 0: return
-  await redisSetEx(data.id.tweetKey, baseCacheTime, encodeForRedis(compress(toFlatty(data))))
+  await redisSetEx(data.id.tweetKey, baseCacheTime, data.toJson())
 
 proc cacheRss*(query: string; rss: Rss) {.async.} =
   let key = "rss:" & query
   await redisHSet(key, "min", rss.cursor)
   if rss.cursor != "suspended":
-    await redisHSet(key, "rss", encodeForRedis(compress(rss.feed)))
+    await redisHSet(key, "rss", rss.feed)
   await redisExpire(key, rssCacheTime)
-
-template deserialize(data, T) =
-  try:
-    result = fromFlatty(uncompress(decodeFromRedis(data)), T)
-  except:
-    echo "Decompression failed($#): '$#'" % [astToStr(T), data]
 
 proc getUserId*(username: string): Future[string] {.async.} =
   let name = toLower(username)
@@ -178,9 +165,17 @@ proc getUserId*(username: string): Future[string] {.async.} =
       return user.id
 
 proc getCachedUser*(username: string; fetch=true): Future[User] {.async.} =
-  let prof = await get("p:" & toLower(username))
-  if prof != redisNil:
-    prof.deserialize(User)
+  let key = "p:" & toLower(username)
+  let prof = await get(key)
+  if prof != redisNil and prof.len > 0:
+    try:
+      result = prof.fromJson(User)
+    except:
+      # Invalid cache, delete and refetch
+      await redisDel(key)
+      if fetch:
+        result = await getGraphUser(username)
+        await cache(result)
   elif fetch:
     result = await getGraphUser(username)
     await cache(result)
@@ -199,31 +194,36 @@ proc getCachedUsername*(userId: string): Future[string] {.async.} =
     if result.len > 0 and user.id.len > 0:
       await all(cacheUserId(result, user.id), cache(user))
 
-# proc getCachedTweet*(id: int64): Future[Tweet] {.async.} =
-#   if id == 0: return
-#   let tweet = await get(id.tweetKey)
-#   if tweet != redisNil:
-#     tweet.deserialize(Tweet)
-#   else:
-#     result = await getGraphTweetResult($id)
-#     if not result.isNil:
-#       await cache(result)
-
 proc getCachedPhotoRail*(id: string): Future[PhotoRail] {.async.} =
   if id.len == 0: return
-  let rail = await get("pr2:" & toLower(id))
-  if rail != redisNil:
-    rail.deserialize(PhotoRail)
+  let key = "pr2:" & toLower(id)
+  let rail = await get(key)
+  if rail != redisNil and rail.len > 0:
+    try:
+      result = rail.fromJson(PhotoRail)
+    except:
+      await redisDel(key)
+      result = await getPhotoRail(id)
+      await cache(result, id)
   else:
     result = await getPhotoRail(id)
     await cache(result, id)
 
 proc getCachedList*(username=""; slug=""; id=""): Future[List] {.async.} =
+  let key = "l:" & id
   let list = if id.len == 0: redisNil
-             else: await get("l:" & id)
+             else: await get(key)
 
-  if list != redisNil:
-    list.deserialize(List)
+  if list != redisNil and list.len > 0:
+    try:
+      result = list.fromJson(List)
+    except:
+      await redisDel(key)
+      if id.len > 0:
+        result = await getGraphList(id)
+      else:
+        result = await getGraphListBySlug(username, slug)
+      await cache(result)
   else:
     if id.len > 0:
       result = await getGraphList(id)
@@ -238,7 +238,6 @@ proc getCachedRss*(key: string): Future[Rss] {.async.} =
     if result.cursor != "suspended":
       let feed = await redisHGet(k, "rss")
       if feed.len > 0 and feed != redisNil:
-        try: result.feed = uncompress(decodeFromRedis(feed))
-        except: echo "Decompressing RSS failed: ", feed
+        result.feed = feed
   else:
     result.cursor.setLen 0
