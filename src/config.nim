@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import parsecfg except Config
-import types, strutils
+import types, strutils, os
 
 proc get*[T](config: parseCfg.Config; section, key: string; default: T): T =
   let val = config.getSectionValue(section, key)
@@ -27,11 +27,11 @@ proc getConfig*(path: string): (Config, parseCfg.Config) =
     listCacheTime: cfg.get("Cache", "listMinutes", 120),
     rssCacheTime: cfg.get("Cache", "rssMinutes", 10),
 
-    redisHost: cfg.get("Cache", "redisHost", "nitter-redis"),
-    redisPort: cfg.get("Cache", "redisPort", 6379),
+    redisHost: getEnv("REDIS_HOST", cfg.get("Cache", "redisHost", "nitter-redis")),
+    redisPort: (let envPort = getEnv("REDIS_PORT", ""); if envPort.len > 0: parseInt(envPort) else: cfg.get("Cache", "redisPort", 6379)),
     redisConns: cfg.get("Cache", "redisConnections", 20),
     redisMaxConns: cfg.get("Cache", "redisMaxConnections", 30),
-    redisPassword: cfg.get("Cache", "redisPassword", ""),
+    redisPassword: getEnv("REDIS_PASSWORD", cfg.get("Cache", "redisPassword", "")),
 
     # Config
     hmacKey: cfg.get("Config", "hmacKey", "secretkey"),
