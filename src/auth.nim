@@ -198,16 +198,33 @@ proc setRateLimit*(session: Session; req: ApiReq; remaining, reset, limit: int) 
 proc initSessionPool*(cfg: Config; path: string) =
   enableLogging = cfg.enableDebug
 
-  if path.endsWith(".json"):
-    log "ERROR: .json is not supported, the file must be a valid JSONL file ending in .jsonl"
-    quit 1
+  # Read session from environment variables (for fly.io secrets)
+  let envKind = getEnv("NITTER_SESSION_KIND", "")
+  let envUsername = getEnv("NITTER_SESSION_USERNAME", "")
+  let envId = getEnv("NITTER_SESSION_ID", "")
+  let envAuthToken = getEnv("NITTER_SESSION_AUTH_TOKEN", "")
+  let envCt0 = getEnv("NITTER_SESSION_CT0", "")
 
-  if not fileExists(path):
-    log "ERROR: ", path, " not found. This file is required to authenticate API requests."
-    quit 1
+  if envAuthToken.len > 0 and envCt0.len > 0:
+    let kind = if envKind.len > 0: envKind else: "cookie"
+    let id = if envId.len > 0: parseBiggestInt(envId) else: 0'i64
 
-  log "parsing JSONL account sessions file: ", path
-  for line in path.lines:
-    sessionPool.add parseSession(line)
+    let session = Session(
+      kind: SessionKind.cookie,
+      id: id,
+      username: envUsername,
+      authToken: envAuthToken,
+      ct0: envCt0
+    )
+    sessionPool.add session
+    log "successfully added 1 account session from environment variables"
+    return
 
-  log "successfully added ", sessionPool.len, " valid account sessions"
+  log "ERROR: NITTER_SESSION_AUTH_TOKEN and NITTER_SESSION_CT0 environment variables are required."
+  log "Please set the following environment variables (e.g., via fly.io secrets):"
+  log "  NITTER_SESSION_KIND=cookie"
+  log "  NITTER_SESSION_USERNAME=your_username"
+  log "  NITTER_SESSION_ID=your_user_id"
+  log "  NITTER_SESSION_AUTH_TOKEN=your_auth_token"
+  log "  NITTER_SESSION_CT0=your_ct0_value"
+  quit 1
