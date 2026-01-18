@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import asyncdispatch, times, strformat, strutils, tables, hashes, os
-import httpclient, json
+import httpclient, json, base64
 import flatty, supersnappy
 
 import types, api
@@ -14,6 +14,16 @@ var
   upstashToken: string
   rssCacheTime: int
   listCacheTime*: int
+
+# Base64 encode/decode for binary data over REST API
+proc encodeForRedis(data: string): string =
+  encode(data)
+
+proc decodeFromRedis(data: string): string =
+  try:
+    decode(data)
+  except:
+    data  # Return original if not base64
 
 # Upstash REST API client
 proc redisCmd(args: seq[string]): Future[JsonNode] {.async.} =
@@ -128,31 +138,31 @@ proc cacheUserId(username, id: string) {.async.} =
   await redisHSet(name.uidKey, name, id)
 
 proc cache*(data: List) {.async.} =
-  await setEx(data.listKey, listCacheTime, compress(toFlatty(data)))
+  await setEx(data.listKey, listCacheTime, encodeForRedis(compress(toFlatty(data))))
 
 proc cache*(data: PhotoRail; name: string) {.async.} =
-  await setEx("pr2:" & toLower(name), baseCacheTime * 2, compress(toFlatty(data)))
+  await setEx("pr2:" & toLower(name), baseCacheTime * 2, encodeForRedis(compress(toFlatty(data))))
 
 proc cache*(data: User) {.async.} =
   if data.username.len == 0: return
   let name = toLower(data.username)
   await cacheUserId(name, data.id)
-  await redisSetEx(name.userKey, baseCacheTime, compress(toFlatty(data)))
+  await redisSetEx(name.userKey, baseCacheTime, encodeForRedis(compress(toFlatty(data))))
 
 proc cache*(data: Tweet) {.async.} =
   if data.isNil or data.id == 0: return
-  await redisSetEx(data.id.tweetKey, baseCacheTime, compress(toFlatty(data)))
+  await redisSetEx(data.id.tweetKey, baseCacheTime, encodeForRedis(compress(toFlatty(data))))
 
 proc cacheRss*(query: string; rss: Rss) {.async.} =
   let key = "rss:" & query
   await redisHSet(key, "min", rss.cursor)
   if rss.cursor != "suspended":
-    await redisHSet(key, "rss", compress(rss.feed))
+    await redisHSet(key, "rss", encodeForRedis(compress(rss.feed)))
   await redisExpire(key, rssCacheTime)
 
 template deserialize(data, T) =
   try:
-    result = fromFlatty(uncompress(data), T)
+    result = fromFlatty(uncompress(decodeFromRedis(data)), T)
   except:
     echo "Decompression failed($#): '$#'" % [astToStr(T), data]
 
@@ -228,7 +238,7 @@ proc getCachedRss*(key: string): Future[Rss] {.async.} =
     if result.cursor != "suspended":
       let feed = await redisHGet(k, "rss")
       if feed.len > 0 and feed != redisNil:
-        try: result.feed = uncompress feed
+        try: result.feed = uncompress(decodeFromRedis(feed))
         except: echo "Decompressing RSS failed: ", feed
   else:
     result.cursor.setLen 0
