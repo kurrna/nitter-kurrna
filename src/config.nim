@@ -21,7 +21,7 @@ proc getConfig*(path: string): (Config, parseCfg.Config) =
     httpMaxConns: cfg.get("Server", "httpMaxConnections", 100),
     staticDir: cfg.get("Server", "staticDir", "./public"),
     title: cfg.get("Server", "title", "Nitter"),
-    hostname: cfg.get("Server", "hostname", "nitter-kurrna.net"),
+    hostname: cfg.get("Server", "hostname", "nitter-kurrna.fly.dev"),
 
     # Cache
     listCacheTime: cfg.get("Cache", "listMinutes", 120),
